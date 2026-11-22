@@ -24,11 +24,17 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
+      - name: Format Rust source
+        run: cargo fmt --all
+
+      - name: Verify formatting
         run: cargo fmt --all -- --check
 
       - name: Check the workspace
         run: cargo check --workspace --all-targets
+
+      - name: Run unit tests
+        run: cargo test --workspace
 
       - name: Build the desktop executable
         run: cargo build --release -p watchdog-desktop
