@@ -49,3 +49,39 @@ impl CapturedFrame {
         self.width > 0 && self.height > 0 && self.rgba.len() == expected
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::{CapturedFrame, WatchGate};
+
+    #[test]
+    fn watch_gate_starts_disabled() {
+        assert!(!WatchGate::default().is_enabled());
+    }
+
+    #[test]
+    fn watch_gate_can_be_enabled_and_disabled() {
+        let gate = WatchGate::new_off();
+        gate.enable();
+        assert!(gate.is_enabled());
+        gate.disable();
+        assert!(!gate.is_enabled());
+    }
+
+    #[test]
+    fn frame_validation_checks_rgba_length() {
+        let valid = CapturedFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 16],
+        };
+        let invalid = CapturedFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 15],
+        };
+        assert!(valid.is_valid());
+        assert!(!invalid.is_valid());
+    }
+}
