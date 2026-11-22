@@ -1,0 +1,9 @@
+[package]
+name = "watchdog-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+watchdog-core = { path = "../watchdog-core" }
+xcap = "0.9.10"
