@@ -421,8 +421,8 @@ impl WatchdogApp {
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("watchdog-game-guide-hud"),
             builder,
-            move |ui, _class| {
-                egui::CentralPanel::default().show(ui.ctx(), |ui| {
+            move |overlay_ctx, _class| {
+                egui::CentralPanel::default().show(overlay_ctx, |ui| {
                     if let Ok(mut hud) = hud_state.lock() {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("WATCHDOG").strong());
