@@ -66,6 +66,7 @@ struct WatchdogApp {
     server_check_pending: Arc<AtomicBool>,
     server_result: SharedServerResult,
     server_status: String,
+    auto_check_started: bool,
 }
 
 impl WatchdogApp {
@@ -118,7 +119,8 @@ impl WatchdogApp {
 
             server_check_pending: Arc::new(AtomicBool::new(false)),
             server_result: Arc::new(Mutex::new(None)),
-            server_status: "Local AI server has not been checked yet.".into(),
+            server_status: "Searching for local Ollama automatically…".into(),
+            auto_check_started: false,
         }
     }
 
@@ -304,7 +306,20 @@ impl WatchdogApp {
                     Ok(models) if models.is_empty() => {
                         "Ollama is reachable, but it reports no downloaded models.".into()
                     }
-                    Ok(models) => format!("Connected to Ollama. Installed models: {}", models.join(", ")),
+                    Ok(models) if !models.is_empty() => {
+                        let preferred = models.iter().find(|name| name.to_lowercase().contains("qwen2.5vl:3b"))
+                            .or_else(|| models.iter().find(|name| {
+                                let lower = name.to_lowercase();
+                                lower.contains("vision") || lower.contains("vl") || lower.contains("llava")
+                            }))
+                            .or_else(|| models.first());
+                        if let Some(model) = preferred {
+                            self.model = model.clone();
+                            format!("Connected automatically. Selected model: {model}. Installed models: {}", models.join(", "))
+                        } else {
+                            "Connected to Ollama, but no models were found.".into()
+                        }
+                    },
                     Err(error) => error,
                 };
             }
@@ -315,7 +330,7 @@ impl WatchdogApp {
         if self.server_check_pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.server_status = "Checking local Ollama server…".into();
+        self.server_status = "Automatically checking local Ollama…".into();
         let endpoint = self.ollama_server.trim().to_owned();
         let pending = Arc::clone(&self.server_check_pending);
         let completed = Arc::clone(&self.server_result);
@@ -503,6 +518,10 @@ impl Drop for WatchdogApp {
 impl eframe::App for WatchdogApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_tasks();
+        if !self.auto_check_started {
+            self.auto_check_started = true;
+            self.check_local_server();
+        }
         self.handle_hud_actions();
 
         if let Ok(error) = self.capture_error.lock() {
