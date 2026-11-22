@@ -8,6 +8,14 @@
 - [x] User-approved SQLite text observations.
 - [x] Windows x64 build workflow.
 
+## Milestone 0.5 — guided game learning
+- [x] User-started game session with Roblox as the default profile name.
+- [x] Always-on-top top-left game guide HUD.
+- [x] Periodic local vision analysis with one suggested next step.
+- [x] Ask one player question when a game mechanic is unclear; wait for the answer.
+- [x] Reuse player explanations and explicitly saved game notes in later analysis.
+- [x] Local Ollama server connectivity check and configurable address.
+
 ## Milestone 1 — interface understanding
 - [ ] OCR and text/element extraction.
 - [ ] Detect the active app or game without collecting account data.
