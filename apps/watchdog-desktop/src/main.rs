@@ -6,14 +6,33 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use watchdog_ai::ask_local;
+use watchdog_ai::{ask_local, check_local_server, coach_game, GameCoachUpdate};
 use watchdog_capture::{CaptureWorker, SharedCaptureError, SharedFrame};
 use watchdog_core::WatchGate;
 use watchdog_memory::MemoryStore;
 
 type SharedAnswer = Arc<Mutex<Option<String>>>;
+type SharedCoachResult = Arc<Mutex<Option<Result<GameCoachUpdate, String>>>>;
+type SharedServerResult = Arc<Mutex<Option<Result<Vec<String>, String>>>>;
+
+#[derive(Default)]
+struct HudState {
+    visible: bool,
+    game_name: String,
+    status: String,
+    current_goal: String,
+    scene_summary: String,
+    next_step: String,
+    question: String,
+    confidence: String,
+    answer_input: String,
+    pending_answer: Option<String>,
+    analyze_now: bool,
+    save_lesson: bool,
+    stop_session: bool,
+}
 
 struct WatchdogApp {
     gate: WatchGate,
@@ -24,6 +43,7 @@ struct WatchdogApp {
     question: String,
     answer: String,
     model: String,
+    ollama_server: String,
     status: String,
     pending: Arc<AtomicBool>,
     completed_answer: SharedAnswer,
@@ -31,6 +51,21 @@ struct WatchdogApp {
     memory_notes: Vec<String>,
     memory_input: String,
     memory_status: String,
+
+    game_name: String,
+    coach_session_active: bool,
+    auto_guidance: bool,
+    coach_waiting_for_answer: bool,
+    next_auto_analysis: Instant,
+    session_context: Vec<String>,
+    last_coach_update: Option<GameCoachUpdate>,
+    coach_hud: Arc<Mutex<HudState>>,
+    coach_pending: Arc<AtomicBool>,
+    coach_result: SharedCoachResult,
+
+    server_check_pending: Arc<AtomicBool>,
+    server_result: SharedServerResult,
+    server_status: String,
 }
 
 impl WatchdogApp {
@@ -61,6 +96,7 @@ impl WatchdogApp {
             question: String::new(),
             answer: "Turn WATCH on to preview your screen, then ask a question about the interface.".into(),
             model: "qwen2.5vl:3b".into(),
+            ollama_server: "http://127.0.0.1:11434".into(),
             status: "WATCH is OFF. No screen capture is running.".into(),
             pending: Arc::new(AtomicBool::new(false)),
             completed_answer: Arc::new(Mutex::new(None)),
@@ -68,6 +104,21 @@ impl WatchdogApp {
             memory_notes,
             memory_input: String::new(),
             memory_status,
+
+            game_name: "Roblox".into(),
+            coach_session_active: false,
+            auto_guidance: true,
+            coach_waiting_for_answer: false,
+            next_auto_analysis: Instant::now(),
+            session_context: Vec::new(),
+            last_coach_update: None,
+            coach_hud: Arc::new(Mutex::new(HudState::default())),
+            coach_pending: Arc::new(AtomicBool::new(false)),
+            coach_result: Arc::new(Mutex::new(None)),
+
+            server_check_pending: Arc::new(AtomicBool::new(false)),
+            server_result: Arc::new(Mutex::new(None)),
+            server_status: "Local AI server has not been checked yet.".into(),
         }
     }
 
@@ -85,6 +136,43 @@ impl WatchdogApp {
         }
     }
 
+    fn start_game_guide(&mut self) {
+        if self.game_name.trim().is_empty() {
+            self.game_name = "Roblox".into();
+        }
+        self.set_watch(true);
+        self.coach_session_active = true;
+        self.auto_guidance = true;
+        self.coach_waiting_for_answer = false;
+        self.session_context.clear();
+        self.last_coach_update = None;
+        self.next_auto_analysis = Instant::now() + Duration::from_secs(3);
+
+        if let Ok(mut hud) = self.coach_hud.lock() {
+            *hud = HudState {
+                visible: true,
+                game_name: self.game_name.trim().to_owned(),
+                status: "Joining the session… waiting for the first game frame.".into(),
+                next_step: "Open your game. WATCHDOG will inspect the visible game screen.".into(),
+                confidence: "low".into(),
+                ..Default::default()
+            };
+        }
+        self.status = format!("{} game-learning session started. The local AI will inspect the screen.", self.game_name);
+    }
+
+    fn stop_game_guide(&mut self) {
+        self.coach_session_active = false;
+        self.auto_guidance = false;
+        self.coach_waiting_for_answer = false;
+        self.set_watch(false);
+        if let Ok(mut hud) = self.coach_hud.lock() {
+            hud.visible = false;
+            hud.status = "Game guide stopped. Screen capture is OFF.".into();
+        }
+        self.status = "Game guide stopped. WATCH is OFF.".into();
+    }
+
     fn ask_local(&mut self) {
         let question = self.question.trim().to_owned();
         if question.is_empty() || self.pending.swap(true, Ordering::AcqRel) {
@@ -97,6 +185,7 @@ impl WatchdogApp {
             None
         };
         let model = self.model.trim().to_owned();
+        let endpoint = format!("{}/api/chat", self.ollama_server.trim().trim_end_matches('/'));
         let pending = Arc::clone(&self.pending);
         let completed = Arc::clone(&self.completed_answer);
 
@@ -104,13 +193,8 @@ impl WatchdogApp {
         self.status = "Waiting for the local model…".into();
 
         thread::spawn(move || {
-            let result = ask_local(
-                "http://127.0.0.1:11434/api/chat",
-                &model,
-                &question,
-                frame.as_ref(),
-            )
-            .unwrap_or_else(|error| format!("Local AI error: {error}"));
+            let result = ask_local(&endpoint, &model, &question, frame.as_ref())
+                .unwrap_or_else(|error| format!("Local AI error: {error}"));
 
             if let Ok(mut slot) = completed.lock() {
                 *slot = Some(result);
@@ -119,37 +203,291 @@ impl WatchdogApp {
         });
     }
 
-    fn save_memory_note(&mut self) {
-        let note = self.memory_input.trim().to_owned();
-        if note.is_empty() {
-            self.memory_status = "Write a note before saving.".into();
+    fn request_game_analysis(&mut self) {
+        if !self.coach_session_active || self.coach_pending.swap(true, Ordering::AcqRel) {
             return;
         }
+
+        let frame = self.latest_frame.lock().ok().and_then(|slot| slot.clone());
+        let Some(frame) = frame else {
+            self.coach_pending.store(false, Ordering::Release);
+            if let Ok(mut hud) = self.coach_hud.lock() {
+                hud.status = "Waiting for the game frame. Keep WATCH on and try again in a moment.".into();
+            }
+            self.next_auto_analysis = Instant::now() + Duration::from_secs(3);
+            return;
+        };
+
+        let model = self.model.trim().to_owned();
+        let endpoint = self.ollama_server.trim().to_owned();
+        let game_name = self.game_name.trim().to_owned();
+        let player_context = self.session_context.clone();
+        let prefix = format!("[Game: {}]", game_name.to_lowercase());
+        let approved_notes = self
+            .memory
+            .as_ref()
+            .and_then(|store| store.list_observations().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|note| note.to_lowercase().starts_with(&prefix))
+            .collect::<Vec<_>>();
+
+        let pending = Arc::clone(&self.coach_pending);
+        let completed = Arc::clone(&self.coach_result);
+        self.next_auto_analysis = Instant::now() + Duration::from_secs(25);
+
+        if let Ok(mut hud) = self.coach_hud.lock() {
+            hud.status = "Local AI is inspecting the current game screen…".into();
+        }
+
+        thread::spawn(move || {
+            let result = coach_game(
+                &endpoint,
+                &model,
+                &game_name,
+                &frame,
+                &player_context,
+                &approved_notes,
+            );
+            if let Ok(mut slot) = completed.lock() {
+                *slot = Some(result);
+            }
+            pending.store(false, Ordering::Release);
+        });
+    }
+
+    fn poll_background_tasks(&mut self) {
+        if let Ok(mut completed) = self.completed_answer.lock() {
+            if let Some(answer) = completed.take() {
+                self.answer = answer;
+                self.status = "Response received from local Ollama.".into();
+            }
+        }
+
+        if let Ok(mut completed) = self.coach_result.lock() {
+            if let Some(result) = completed.take() {
+                match result {
+                    Ok(update) => {
+                        self.coach_waiting_for_answer = !update.question.trim().is_empty();
+                        if let Ok(mut hud) = self.coach_hud.lock() {
+                            hud.game_name = update.game_name.clone();
+                            hud.current_goal = update.current_goal.clone();
+                            hud.scene_summary = update.scene_summary.clone();
+                            hud.next_step = update.next_step.clone();
+                            hud.question = update.question.clone();
+                            hud.confidence = update.confidence.clone();
+                            hud.status = if self.coach_waiting_for_answer {
+                                "I need one detail from you before I continue.".into()
+                            } else {
+                                "Screen inspected. I will check again during the active session.".into()
+                            };
+                        }
+                        self.status = "Game coach updated from the current screen.".into();
+                        self.last_coach_update = Some(update);
+                        self.next_auto_analysis = Instant::now() + Duration::from_secs(25);
+                    }
+                    Err(error) => {
+                        self.coach_waiting_for_answer = true;
+                        if let Ok(mut hud) = self.coach_hud.lock() {
+                            hud.status = format!("Local AI issue: {error}");
+                            hud.question = "Can you check that Ollama is running and the selected vision model is installed?".into();
+                        }
+                        self.status = format!("Game coach could not analyze the screen: {error}");
+                    }
+                }
+            }
+        }
+
+        if let Ok(mut completed) = self.server_result.lock() {
+            if let Some(result) = completed.take() {
+                self.server_status = match result {
+                    Ok(models) if models.is_empty() => {
+                        "Ollama is reachable, but it reports no downloaded models.".into()
+                    }
+                    Ok(models) => format!("Connected to Ollama. Installed models: {}", models.join(", ")),
+                    Err(error) => error,
+                };
+            }
+        }
+    }
+
+    fn check_local_server(&mut self) {
+        if self.server_check_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.server_status = "Checking local Ollama server…".into();
+        let endpoint = self.ollama_server.trim().to_owned();
+        let pending = Arc::clone(&self.server_check_pending);
+        let completed = Arc::clone(&self.server_result);
+        thread::spawn(move || {
+            let result = check_local_server(&endpoint);
+            if let Ok(mut slot) = completed.lock() {
+                *slot = Some(result);
+            }
+            pending.store(false, Ordering::Release);
+        });
+    }
+
+    fn save_game_lesson(&mut self) {
+        let Some(update) = self.last_coach_update.clone() else {
+            self.memory_status = "There is no coach finding to save yet.".into();
+            return;
+        };
+
+        let player_detail = self.session_context.last().cloned().unwrap_or_default();
+        let note = format!(
+            "[Game: {}] Goal: {} | Screen: {} | Useful fact: {} | Suggested step: {} | Player explanation: {}",
+            self.game_name.trim(),
+            update.current_goal,
+            update.scene_summary,
+            update.learning,
+            update.next_step,
+            player_detail
+        );
 
         match self.memory.as_ref() {
             Some(store) => match store.save_observation(&note) {
                 Ok(()) => {
-                    self.memory_input.clear();
                     self.memory_notes = store.list_observations().unwrap_or_default();
-                    self.memory_status = "Saved locally. You can clear these notes below.".into();
+                    self.memory_status = "Saved this game lesson locally. It can guide future sessions.".into();
+                    if let Ok(mut hud) = self.coach_hud.lock() {
+                        hud.status = "Lesson saved to your local game memory.".into();
+                    }
                 }
-                Err(error) => self.memory_status = format!("Could not save note: {error}"),
-            },
-            None => self.memory_status = "Local memory is unavailable. Check the app data folder permissions.".into(),
-        }
-    }
-
-    fn clear_memory(&mut self) {
-        match self.memory.as_ref() {
-            Some(store) => match store.clear() {
-                Ok(()) => {
-                    self.memory_notes.clear();
-                    self.memory_status = "All saved notes were cleared.".into();
-                }
-                Err(error) => self.memory_status = format!("Could not clear memory: {error}"),
+                Err(error) => self.memory_status = format!("Could not save game lesson: {error}"),
             },
             None => self.memory_status = "Local memory is unavailable.".into(),
         }
+    }
+
+    fn handle_hud_actions(&mut self) {
+        let (answer, analyze, save, stop) = if let Ok(mut hud) = self.coach_hud.lock() {
+            (
+                hud.pending_answer.take(),
+                std::mem::take(&mut hud.analyze_now),
+                std::mem::take(&mut hud.save_lesson),
+                std::mem::take(&mut hud.stop_session),
+            )
+        } else {
+            (None, false, false, false)
+        };
+
+        let mut should_analyze = analyze;
+        if let Some(answer) = answer.filter(|answer| !answer.trim().is_empty()) {
+            self.session_context.push(format!("Player explanation: {}", answer.trim()));
+            self.coach_waiting_for_answer = false;
+            if let Ok(mut hud) = self.coach_hud.lock() {
+                hud.question.clear();
+                hud.status = "Thanks. I will use your explanation to understand the game.".into();
+            }
+            should_analyze = true;
+        }
+
+        if save {
+            self.save_game_lesson();
+        }
+        if stop {
+            self.stop_game_guide();
+            return;
+        }
+        if should_analyze {
+            self.request_game_analysis();
+        }
+    }
+
+    fn show_game_hud(&mut self, ctx: &egui::Context) {
+        if !self.coach_session_active {
+            return;
+        }
+        let visible = self
+            .coach_hud
+            .lock()
+            .map(|hud| hud.visible)
+            .unwrap_or(false);
+        if !visible {
+            return;
+        }
+
+        let hud_state = Arc::clone(&self.coach_hud);
+        let builder = egui::ViewportBuilder::default()
+            .with_title("WATCHDOG Game Guide")
+            .with_inner_size([370.0, 300.0])
+            .with_min_inner_size([320.0, 230.0])
+            .with_position(egui::pos2(16.0, 54.0))
+            .with_always_on_top()
+            .with_decorations(false)
+            .with_resizable(true);
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("watchdog-game-guide-hud"),
+            builder,
+            move |ui, _class| {
+                egui::CentralPanel::default().show(ui.ctx(), |ui| {
+                    if let Ok(mut hud) = hud_state.lock() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("WATCHDOG").strong());
+                            ui.label(egui::RichText::new(format!("{} GUIDE", hud.game_name.to_uppercase())).weak());
+                            if ui.button("Hide").clicked() {
+                                hud.visible = false;
+                            }
+                        });
+                        ui.separator();
+
+                        ui.label(egui::RichText::new("NEXT STEP").small().weak());
+                        ui.label(egui::RichText::new(if hud.next_step.is_empty() {
+                            "Inspecting the game screen…"
+                        } else {
+                            hud.next_step.as_str()
+                        }).strong());
+
+                        if !hud.current_goal.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("CURRENT GOAL").small().weak());
+                            ui.label(&hud.current_goal);
+                        }
+                        if !hud.scene_summary.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&hud.scene_summary).small());
+                        }
+                        if !hud.question.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("HELP ME UNDERSTAND").small().strong());
+                            ui.label(&hud.question);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut hud.answer_input)
+                                    .hint_text("Type what this button or item does…")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if ui.button("Send answer").clicked() {
+                                let answer = hud.answer_input.trim().to_owned();
+                                if !answer.is_empty() {
+                                    hud.pending_answer = Some(answer);
+                                    hud.answer_input.clear();
+                                }
+                            }
+                        }
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Analyze now").clicked() {
+                                hud.analyze_now = true;
+                            }
+                            if ui.button("Save lesson").clicked() {
+                                hud.save_lesson = true;
+                            }
+                            if ui.button("Stop guide").clicked() {
+                                hud.stop_session = true;
+                            }
+                        });
+                        ui.label(egui::RichText::new(format!(
+                            "{} · confidence: {}",
+                            hud.status,
+                            if hud.confidence.is_empty() { "—" } else { hud.confidence.as_str() }
+                        )).small().weak());
+                    }
+                });
+            },
+        );
     }
 }
 
@@ -164,12 +502,8 @@ impl Drop for WatchdogApp {
 
 impl eframe::App for WatchdogApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(mut answer) = self.completed_answer.lock() {
-            if let Some(answer) = answer.take() {
-                self.answer = answer;
-                self.status = "Response received from local Ollama.".into();
-            }
-        }
+        self.poll_background_tasks();
+        self.handle_hud_actions();
 
         if let Ok(error) = self.capture_error.lock() {
             if let Some(error) = error.as_ref() {
@@ -177,10 +511,19 @@ impl eframe::App for WatchdogApp {
             }
         }
 
+        if self.coach_session_active
+            && self.auto_guidance
+            && !self.coach_waiting_for_answer
+            && !self.coach_pending.load(Ordering::Acquire)
+            && Instant::now() >= self.next_auto_analysis
+        {
+            self.request_game_analysis();
+        }
+
         egui::TopBottomPanel::top("watchdog_header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("WATCHDOG");
-                ui.label(egui::RichText::new("LOCAL VISUAL ASSISTANT").small().weak());
+                ui.label(egui::RichText::new("LOCAL GAME COACH").small().weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let label = if self.gate.is_enabled() { "■  STOP WATCH" } else { "▶  START WATCH" };
                     if ui.add_sized([150.0, 36.0], egui::Button::new(label)).clicked() {
@@ -189,6 +532,14 @@ impl eframe::App for WatchdogApp {
                 });
             });
         });
+
+        let mut start_guide_clicked = false;
+        let mut stop_guide_clicked = false;
+        let mut analyze_clicked = false;
+        let mut save_lesson_clicked = false;
+        let mut ask_clicked = false;
+        let mut server_check_clicked = false;
+        let mut show_hud_clicked = false;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -199,11 +550,68 @@ impl eframe::App for WatchdogApp {
                 }
                 ui.label(&self.status);
             });
-            ui.separator();
 
+            egui::CollapsingHeader::new("Roblox and game learning session")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label("Start this when you enter a game. WATCHDOG will inspect the visible game UI and guide you one step at a time.");
+                    ui.horizontal(|ui| {
+                        ui.label("Game");
+                        ui.text_edit_singleline(&mut self.game_name);
+                        ui.checkbox(&mut self.auto_guidance, "Automatic suggestions");
+                    });
+                    ui.horizontal(|ui| {
+                        if !self.coach_session_active {
+                            if ui.button("Start game guide").clicked() {
+                                start_guide_clicked = true;
+                            }
+                        } else {
+                            if ui.button("Analyze screen now").clicked() {
+                                analyze_clicked = true;
+                            }
+                            if ui.button("Save current lesson").clicked() {
+                                save_lesson_clicked = true;
+                            }
+                            if ui.button("Stop game guide").clicked() {
+                                stop_guide_clicked = true;
+                            }
+                            let visible = self.coach_hud.lock().map(|hud| hud.visible).unwrap_or(false);
+                            if !visible && ui.button("Show top-left HUD").clicked() {
+                                show_hud_clicked = true;
+                            }
+                        }
+                    });
+                    ui.label(egui::RichText::new(
+                        "The floating guide is an always-on-top window. It suggests actions but never clicks or plays for you."
+                    ).small().weak());
+                });
+
+            ui.separator();
+            ui.collapsing("Local AI server", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Ollama address");
+                    ui.text_edit_singleline(&mut self.ollama_server);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Vision model");
+                    ui.text_edit_singleline(&mut self.model);
+                    if ui.add_enabled(
+                        !self.server_check_pending.load(Ordering::Acquire),
+                        egui::Button::new("Test server")
+                    ).clicked() {
+                        server_check_clicked = true;
+                    }
+                });
+                ui.label(egui::RichText::new(&self.server_status).small().weak());
+                ui.label(egui::RichText::new(
+                    "Local-only endpoint. Default: http://127.0.0.1:11434. No cloud AI endpoint is used."
+                ).small().weak());
+            });
+
+            ui.separator();
             ui.columns(2, |columns| {
                 columns[0].heading("Screen preview");
-                columns[0].label("Frames stay in memory only; they are not written to disk.");
+                columns[0].label("Live frames stay in memory. WATCH does not save a video or screenshot file.");
 
                 let current_frame = self.latest_frame.lock().ok().and_then(|slot| slot.clone());
                 if self.gate.is_enabled() {
@@ -240,65 +648,99 @@ impl eframe::App for WatchdogApp {
                 }
 
                 columns[1].heading("Ask local AI");
-                columns[1].label("Questions and optional frames go to Ollama on this PC.");
-                columns[1].horizontal(|ui| {
-                    ui.label("Model");
-                    ui.text_edit_singleline(&mut self.model);
-                });
+                columns[1].label("Ask a question about the current screen.");
                 columns[1].add(
                     egui::TextEdit::multiline(&mut self.question)
-                        .hint_text("Example: Where is the shop menu?")
-                        .desired_rows(4)
+                        .hint_text("What does this menu do?")
+                        .desired_rows(3)
                         .desired_width(f32::INFINITY),
                 );
-                let waiting = self.pending.load(Ordering::Acquire);
                 if columns[1]
-                    .add_enabled(!waiting, egui::Button::new("Ask local AI"))
+                    .add_enabled(!self.pending.load(Ordering::Acquire), egui::Button::new("Ask local AI"))
                     .clicked()
                 {
-                    self.ask_local();
+                    ask_clicked = true;
                 }
-
-                columns[1].add_space(10.0);
+                columns[1].add_space(8.0);
                 columns[1].heading("Answer");
                 egui::ScrollArea::vertical()
-                    .max_height(210.0)
-                    .show(&mut columns[1], |ui| {
-                        ui.label(&self.answer);
-                    });
+                    .max_height(150.0)
+                    .show(&mut columns[1], |ui| ui.label(&self.answer));
             });
 
             ui.separator();
-            ui.heading("Your interface memory");
-            ui.label("Save text notes only when you choose. Screenshots are never stored in this database.");
+            ui.heading("Your local interface memory");
+            ui.label("Save only text notes that you approve. Game lessons are kept separately by game name.");
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.memory_input);
                 if ui.button("Save note").clicked() {
-                    self.save_memory_note();
+                    let note = self.memory_input.trim().to_owned();
+                    if !note.is_empty() {
+                        if let Some(store) = self.memory.as_ref() {
+                            match store.save_observation(&note) {
+                                Ok(()) => {
+                                    self.memory_input.clear();
+                                    self.memory_notes = store.list_observations().unwrap_or_default();
+                                    self.memory_status = "Saved locally.".into();
+                                }
+                                Err(error) => self.memory_status = format!("Could not save note: {error}"),
+                            }
+                        }
+                    }
                 }
                 if ui.button("Clear memory").clicked() {
-                    self.clear_memory();
+                    if let Some(store) = self.memory.as_ref() {
+                        match store.clear() {
+                            Ok(()) => {
+                                self.memory_notes.clear();
+                                self.memory_status = "All saved notes were cleared.".into();
+                            }
+                            Err(error) => self.memory_status = format!("Could not clear memory: {error}"),
+                        }
+                    }
                 }
             });
             ui.label(egui::RichText::new(&self.memory_status).small().weak());
-
-            egui::ScrollArea::vertical()
-                .max_height(100.0)
-                .show(ui, |ui| {
-                    for note in self.memory_notes.iter().take(12) {
-                        ui.label(format!("• {note}"));
-                    }
-                    if self.memory_notes.is_empty() {
-                        ui.label("No saved notes yet.");
-                    }
-                });
+            egui::ScrollArea::vertical().max_height(90.0).show(ui, |ui| {
+                for note in self.memory_notes.iter().take(8) {
+                    ui.label(format!("• {note}"));
+                }
+                if self.memory_notes.is_empty() {
+                    ui.label("No saved notes yet.");
+                }
+            });
 
             ui.separator();
             ui.label(egui::RichText::new(
-                "Privacy: WATCH starts OFF. STOP closes capture and clears the latest frame. No analytics, keylogging, credential collection, cloud uploads, or automatic clicks.",
+                "Privacy: WATCH starts OFF. STOP clears the current frame. The local model sees only frames sent during your active session. No keylogging, credential collection, cloud uploads, or automatic game actions."
             ).small().weak());
         });
 
+        if start_guide_clicked {
+            self.start_game_guide();
+        }
+        if stop_guide_clicked {
+            self.stop_game_guide();
+        }
+        if analyze_clicked {
+            self.request_game_analysis();
+        }
+        if save_lesson_clicked {
+            self.save_game_lesson();
+        }
+        if ask_clicked {
+            self.ask_local();
+        }
+        if server_check_clicked {
+            self.check_local_server();
+        }
+        if show_hud_clicked {
+            if let Ok(mut hud) = self.coach_hud.lock() {
+                hud.visible = true;
+            }
+        }
+
+        self.show_game_hud(ctx);
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
@@ -322,13 +764,13 @@ fn open_memory() -> (Option<MemoryStore>, String) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1160.0, 820.0])
-            .with_min_inner_size([860.0, 620.0]),
+            .with_inner_size([1180.0, 900.0])
+            .with_min_inner_size([900.0, 680.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "WATCHDOG — Local Visual Assistant",
+        "WATCHDOG — Local Visual Game Coach",
         options,
         Box::new(|cc| Ok(Box::new(WatchdogApp::new(cc)))),
     )
