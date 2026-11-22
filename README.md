@@ -16,6 +16,17 @@ WATCHDOG is built around one idea: you should be able to open an unfamiliar app 
 - A local SQLite memory store for observations that the user explicitly chooses to save.
 - Modular crates so different contributors and coding agents can work on independent parts.
 
+## Game guide (first implementation)
+
+- Start a visible **game-learning session** before or after joining a Roblox game. Roblox is the default, but the game name can be changed.
+- WATCHDOG opens a small always-on-top guide HUD near the top-left of the desktop.
+- The local vision model inspects the current screen during the session and suggests one next step, such as opening a shop or trying a visible in-game control.
+- When it cannot understand a mechanic, it asks one short question and waits for the player's explanation before continuing.
+- Your explanation is included in later local AI requests. Use **Save lesson** to deliberately store a useful text finding in local SQLite memory.
+- Automatic guidance can be switched off, and **Stop guide** turns WATCH off and clears the latest frame.
+
+This is a live, periodic screen-observation session, **not a video recorder**. Frames are held temporarily in memory and are not saved as video files. The floating HUD works best with Roblox in windowed or borderless mode; some exclusive-fullscreen games may cover other windows.
+
 ## What is not implemented yet
 
 OCR extraction, app/game detection, automatic interface learning, semantic search, persistent chat history, window-specific capture, model downloads, and approved UI actions are roadmap work. The app does not secretly click, type, navigate, or control other applications.
