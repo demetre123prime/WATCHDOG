@@ -1,0 +1,42 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Build WATCHDOG for Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check the workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Build the desktop executable
+        run: cargo build --release -p watchdog-desktop
+
+      - name: Upload the Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchdog-windows-x64
+          path: target/release/watchdog.exe
+          if-no-files-found: error
+          retention-days: 14
