@@ -1,0 +1,16 @@
+[package]
+name = "watchdog-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "watchdog"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+watchdog-ai = { path = "../../crates/watchdog-ai" }
+watchdog-capture = { path = "../../crates/watchdog-capture" }
+watchdog-core = { path = "../../crates/watchdog-core" }
+watchdog-memory = { path = "../../crates/watchdog-memory" }
