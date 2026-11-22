@@ -35,8 +35,8 @@ OCR extraction, app/game detection, automatic interface learning, semantic searc
 
 Requirements:
 - Rust stable toolchain (Rust 1.88+ recommended)
-- [Ollama](https://ollama.com/) running locally
-- A vision-capable Ollama model
+- [Ollama](https://ollama.com/) installed locally
+- A vision-capable Ollama model (WATCHDOG automatically checks the default local Ollama endpoint at startup and selects an installed model, preferring Qwen2.5-VL 3B and other vision models)
 
 Install a small vision model:
 
