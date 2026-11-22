@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "apps/watchdog-desktop",
+    "crates/watchdog-core",
+    "crates/watchdog-capture",
+    "crates/watchdog-ai",
+    "crates/watchdog-memory",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/demetre123prime/WATCHDOG"
